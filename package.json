@@ -1,0 +1,9 @@
+{
+  "name": "feishu-claude-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.0",
+    "axios": "^1.6.0"
+  }
+}
