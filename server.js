@@ -1,11 +1,28 @@
 import express from "express";
-import Anthropic from "@anthropic-ai/sdk";
 import axios from "axios";
 
 const app = express();
 app.use(express.json());
 
-const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+async function askDeepSeek(userMessage) {
+  const res = await axios.post(
+    "https://api.deepseek.com/chat/completions",
+    {
+      model: "deepseek-chat",
+      messages: [
+        { role: "system", content: "你是一个智能助手，请用中文回答。" },
+        { role: "user", content: userMessage }
+      ],
+    },
+    {
+      headers: {
+        "Authorization": `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json",
+      }
+    }
+  );
+  return res.data.choices[0].message.content;
+}
 
 async function getTenantToken() {
   const res = await axios.post(
@@ -39,17 +56,12 @@ app.post("/api/webhook", async (req, res) => {
       const userText = content.text.replace(/@\S+/g, "").trim();
       const chatId = event.message.chat_id;
 
-      const reply = await claude.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1024,
-        system: "你是一个智能助手，请用中文回答。",
-        messages: [{ role: "user", content: userText }],
-      });
+      const text = await askDeepSeek(userText);
 
       const token = await getTenantToken();
       await axios.post(
         "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
-        { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: reply.content[0].text }) },
+        { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) },
         { headers: { Authorization: `Bearer ${token}` } }
       );
     } catch (err) {
@@ -58,5 +70,5 @@ app.post("/api/webhook", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
