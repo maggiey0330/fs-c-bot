@@ -181,6 +181,8 @@ async function syncProducts() {
     await new Promise(r => setTimeout(r, 200));
   }
   console.log(`✅ 同步完成！新增: ${created} 更新: ${updated} 删除: ${toDeleteIds.length}`);
+  const NOTIFY_CHAT_ID = "oc_564a686f2219aec81155ef7ce5212978";
+await sendLarkMessage(NOTIFY_CHAT_ID, `✅ 库存同步完成！\n更新: ${updated} 件  新增: ${created} 件  删除: ${toDeleteIds.length} 件\n同步时间: ${new Date().toLocaleString("zh-CN")}`);
 }
 
 // ── 定时任务：每天早上9点（上海时间）──
