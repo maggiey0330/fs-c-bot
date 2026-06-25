@@ -1,25 +1,16 @@
-import express from "express";
-import Anthropic from "@anthropic-ai/sdk";
-import axios from "axios";
-
-const app = express();
-app.use(express.json());
-
-const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-async function getTenantToken() {
-  const res = await axios.post(
-    "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-    { app_id: process.env.FEISHU_APP_ID, app_secret: process.env.FEISHU_APP_SECRET }
-  );
-  return res.data.tenant_access_token;
-}
-
 app.post("/api/webhook", async (req, res) => {
   const body = req.body;
+  
+  console.log("收到请求:", JSON.stringify(body));
 
-  if (body.type === "url_verification" || body.challenge) {
-    return res.json({ challenge: body.challenge });
+  // 飞书验证
+  if (body.type === "url_verification") {
+    console.log("验证请求, challenge:", body.challenge);
+    return res.status(200).json({ challenge: body.challenge });
+  }
+
+  if (body.challenge) {
+    return res.status(200).json({ challenge: body.challenge });
   }
 
   res.status(200).end();
@@ -47,8 +38,3 @@ app.post("/api/webhook", async (req, res) => {
     );
   }
 });
-
-app.get("/", (req, res) => res.send("ok"));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
