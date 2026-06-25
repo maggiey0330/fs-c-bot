@@ -51,4 +51,13 @@ app.post("/api/webhook", async (req, res) => {
       await axios.post(
         "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
         { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text: reply.content[0].text }) },
-        {
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+    } catch (err) {
+      console.error("Error:", err);
+    }
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
