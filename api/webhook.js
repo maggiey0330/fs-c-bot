@@ -2,13 +2,22 @@ import { askClaude } from "../lib/claude.js";
 import { sendMessage } from "../lib/feishu.js";
 
 export default async function handler(req, res) {
+  // 支持 GET 请求（飞书验证用）
+  if (req.method === "GET") {
+    return res.status(200).json({ message: "ok" });
+  }
+
   if (req.method !== "POST") return res.status(405).end();
 
   const body = req.body;
 
-  // 飞书验证 URL（首次配置时需要）
+  // 飞书验证 URL challenge
   if (body.type === "url_verification") {
-    return res.json({ challenge: body.challenge });
+    return res.status(200).json({ challenge: body.challenge });
+  }
+
+  if (body.challenge) {
+    return res.status(200).json({ challenge: body.challenge });
   }
 
   // 处理消息事件
@@ -22,7 +31,6 @@ export default async function handler(req, res) {
     const userText = content.text.replace(/@\S+/g, "").trim();
     const chatId = event.message.chat_id;
 
-    // 先返回 200，避免飞书超时重试
     res.status(200).end();
 
     try {
