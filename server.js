@@ -208,6 +208,7 @@ app.post("/api/webhook", async (req, res) => {
       const content = JSON.parse(event.message.content);
       const userText = content.text.replace(/@\S+/g, "").trim();
       const chatId = event.message.chat_id;
+      console.log("chat_id:", chatId);
 
       // 查货号：「查 BKM」「货号 SANR」
       const queryMatch = userText.match(/^(查|货号|查询)\s*(.+)/);
