@@ -209,7 +209,7 @@ async function checkPendingShipments() {
   // 1. 拉待发货订单
   const result = await xgjPost("/order/list", {
     authorize_id: AUTHORIZE_ID,
-    order_status: 22, // 待发货/已售出
+    order_status: 12, // 12 = 待发货（已付款、未发货）
     page_no: 1,
     page_size: 50,
   });
@@ -217,7 +217,7 @@ async function checkPendingShipments() {
 
   // 状态码为主判断，取消/退款字段做兜底校验
   const pending = allOrders.filter(o =>
-    o.order_status === 22 &&
+    o.order_status === 12 &&
     (!o.cancel_time || o.cancel_time === 0) &&
     (!o.refund_status || o.refund_status === 0)
   );
