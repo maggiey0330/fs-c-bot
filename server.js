@@ -4,12 +4,15 @@ import crypto from "crypto";
 import cron from "node-cron";
 
 const app = express();
-app.use(express.json());
+// 保留原始 body，飞书签名校验需要用到未被解析改写过的原始字节
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 const {
   DEEPSEEK_API_KEY,
   FEISHU_APP_ID,
   FEISHU_APP_SECRET,
+  FEISHU_VERIFY_TOKEN, // 飞书开发者后台「事件订阅」里的 Verification Token
+  FEISHU_ENCRYPT_KEY,  // 飞书开发者后台「事件订阅」里的 Encrypt Key（如果开启了加密）
   XGJ_APP_KEY,
   XGJ_APP_SECRET,
   BITABLE_APP_TOKEN,
@@ -85,9 +88,10 @@ async function xgjPost(path, body = {}) {
 
 // ── 查货号 ──
 async function queryProductByKeyword(keyword) {
+  const safeKeyword = keyword.replace(/["\\]/g, "");
   const token = await getLarkToken();
   const data = await larkRequest(token, "GET",
-    `/bitable/v1/apps/${BITABLE_APP_TOKEN}/tables/${TABLE_ID}/records?page_size=10&filter=CurrentValue.[商品标题].contains("${keyword}")`
+    `/bitable/v1/apps/${BITABLE_APP_TOKEN}/tables/${TABLE_ID}/records?page_size=10&filter=CurrentValue.[商品标题].contains("${safeKeyword}")`
   );
   return data.data?.items || [];
 }
@@ -263,14 +267,72 @@ cron.schedule("0 9 * * *", () => {
   syncProducts().catch(console.error);
 }, { timezone: "Asia/Shanghai" });
 
+// ── 定时任务：每小时检查一次待发货超时订单 ──
+cron.schedule("0 * * * *", () => {
+  checkPendingShipments().catch(console.error);
+}, { timezone: "Asia/Shanghai" });
+
+// ── 飞书事件订阅：解密 + 签名校验 ──
+function decryptFeishuEvent(encryptStr) {
+  const key = crypto.createHash("sha256").update(FEISHU_ENCRYPT_KEY).digest();
+  const buf = Buffer.from(encryptStr, "base64");
+  const iv = buf.subarray(0, 16);
+  const data = buf.subarray(16);
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  let decrypted = decipher.update(data, undefined, "utf8");
+  decrypted += decipher.final("utf8");
+  return JSON.parse(decrypted);
+}
+
+// 仅在配置了 Encrypt Key 时校验签名（飞书加密回调要求：sha1(timestamp+nonce+encryptKey+rawBody)）
+function verifyFeishuSignature(req) {
+  if (!FEISHU_ENCRYPT_KEY) return true;
+  const timestamp = req.headers["x-lark-request-timestamp"];
+  const nonce = req.headers["x-lark-request-nonce"];
+  const signature = req.headers["x-lark-signature"];
+  if (!timestamp || !nonce || !signature || !req.rawBody) return false;
+  const content = Buffer.concat([
+    Buffer.from(timestamp + nonce + FEISHU_ENCRYPT_KEY),
+    req.rawBody,
+  ]);
+  const hash = crypto.createHash("sha1").update(content).digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
+
 // ── Webhook ──
 app.get("/", (req, res) => res.send("ok"));
 
 app.post("/api/webhook", async (req, res) => {
-  const body = req.body;
+  // 1. 签名校验（开启了 Encrypt Key 的情况下）
+  if (!verifyFeishuSignature(req)) {
+    console.warn("⚠️ 飞书签名校验失败，已拒绝请求");
+    return res.status(401).end();
+  }
 
+  // 2. 解密（如果开启了加密），否则直接用明文 body
+  let body = req.body;
+  if (body.encrypt) {
+    try {
+      body = decryptFeishuEvent(body.encrypt);
+    } catch (err) {
+      console.error("解密飞书事件失败:", err.message);
+      return res.status(400).end();
+    }
+  }
+
+  // 3. url_verification 阶段
   if (body.type === "url_verification" || body.challenge) {
     return res.status(200).json({ challenge: body.challenge });
+  }
+
+  // 4. Token 校验（未加密的旧版事件订阅模式，必须配置 FEISHU_VERIFY_TOKEN）
+  if (FEISHU_VERIFY_TOKEN && body.token !== FEISHU_VERIFY_TOKEN) {
+    console.warn("⚠️ 飞书 Verification Token 不匹配，已拒绝请求");
+    return res.status(401).end();
   }
 
   res.status(200).end();
