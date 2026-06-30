@@ -4,6 +4,11 @@ import crypto from "crypto";
 import cron from "node-cron";
 
 const app = express();
+// 最早期的请求日志：在任何 body 解析之前就打印，方便排查"请求是否真的到达了服务器"
+app.use((req, res, next) => {
+  console.log(`📩 收到请求 ${req.method} ${req.url} @ ${new Date().toISOString()}`);
+  next();
+});
 // 保留原始 body，飞书签名校验需要用到未被解析改写过的原始字节
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
@@ -307,11 +312,13 @@ function verifyFeishuSignature(req) {
 app.get("/", (req, res) => res.send("ok"));
 
 app.post("/api/webhook", async (req, res) => {
+  console.log("➡️ 进入 /api/webhook 处理函数");
   // 1. 签名校验（开启了 Encrypt Key 的情况下）
   if (!verifyFeishuSignature(req)) {
     console.warn("⚠️ 飞书签名校验失败，已拒绝请求");
     return res.status(401).end();
   }
+  console.log("✅ 签名校验通过（或未开启加密）");
 
   // 2. 解密（如果开启了加密），否则直接用明文 body
   let body = req.body;
@@ -323,6 +330,7 @@ app.post("/api/webhook", async (req, res) => {
       return res.status(400).end();
     }
   }
+  console.log("📦 body 解析完成, type:", body.type, "event_type:", body.header?.event_type);
 
   // 3. url_verification 阶段
   if (body.type === "url_verification" || body.challenge) {
@@ -331,9 +339,10 @@ app.post("/api/webhook", async (req, res) => {
 
   // 4. Token 校验（未加密的旧版事件订阅模式，必须配置 FEISHU_VERIFY_TOKEN）
   if (FEISHU_VERIFY_TOKEN && body.token !== FEISHU_VERIFY_TOKEN) {
-    console.warn("⚠️ 飞书 Verification Token 不匹配，已拒绝请求");
+    console.warn("⚠️ 飞书 Verification Token 不匹配，已拒绝请求 body.token=", body.token);
     return res.status(401).end();
   }
+  console.log("✅ Token 校验通过（或未配置）, 即将返回 200");
 
   res.status(200).end();
 
@@ -387,6 +396,13 @@ app.post("/api/webhook", async (req, res) => {
       console.error("Error:", err);
     }
   }
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("🔴 未处理的 Promise 异常 (unhandledRejection):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("🔴 未捕获的异常 (uncaughtException):", err);
 });
 
 const PORT = process.env.PORT || 8080;
