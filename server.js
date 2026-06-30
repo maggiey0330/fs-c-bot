@@ -182,10 +182,83 @@ async function syncProducts() {
   }
   console.log(`✅ 同步完成！新增: ${created} 更新: ${updated} 删除: ${toDeleteIds.length}`);
   const NOTIFY_CHAT_ID = "oc_564a686f2219aec81155ef7ce5212978";
-await sendLarkMessage(NOTIFY_CHAT_ID, `✅ 库存同步完成！\n更新: ${updated} 件  新增: ${created} 件  删除: ${toDeleteIds.length} 件\n同步时间: ${new Date().toLocaleString("zh-CN")}`);
+  await sendLarkMessage(NOTIFY_CHAT_ID, `✅ 库存同步完成！\n更新: ${updated} 件  新增: ${created} 件  删除: ${toDeleteIds.length} 件\n同步时间: ${new Date().toLocaleString("zh-CN")}`);
 }
 
-// ── 定时任务：每天早上9点（上海时间）──
+// ── 待发货提醒 ──
+const OVERDUE_HOURS = 24; // 超过多少小时未发货算超时
+const remindedToday = {}; // 记录：{ "2026/6/30": Set(order_no) }，按天去重，重启会清空
+
+async function checkPendingShipments() {
+  console.log(`[${new Date().toLocaleString("zh-CN")}] 开始检查待发货订单...`);
+  const NOTIFY_CHAT_ID = "oc_564a686f2219aec81155ef7ce5212978";
+  const now = Math.floor(Date.now() / 1000);
+  const overdueSeconds = OVERDUE_HOURS * 3600;
+  const today = new Date().toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
+  if (!remindedToday[today]) remindedToday[today] = new Set();
+
+  // 1. 拉待发货订单
+  const result = await xgjPost("/order/list", {
+    authorize_id: AUTHORIZE_ID,
+    order_status: 22, // 待发货/已售出
+    page_no: 1,
+    page_size: 50,
+  });
+  const allOrders = result.list || [];
+
+  // 状态码为主判断，取消/退款字段做兜底校验
+  const pending = allOrders.filter(o =>
+    o.order_status === 22 &&
+    (!o.cancel_time || o.cancel_time === 0) &&
+    (!o.refund_status || o.refund_status === 0)
+  );
+
+  // 筛选：超时 + 今天还没提醒过
+  const toRemind = pending.filter(o => {
+    const elapsed = now - o.pay_time;
+    return elapsed >= overdueSeconds && !remindedToday[today].has(o.order_no);
+  });
+
+  if (toRemind.length === 0) {
+    console.log("没有需要提醒的待发货订单");
+    return "✅ 没有超时未发货的订单";
+  }
+
+  // 2. 查飞书商品表，拿货架号（按 product_id 关联）
+  const token = await getLarkToken();
+  const shelfMap = {}; // { product_id: 货架位置 }
+  let pageToken = "";
+  while (true) {
+    const url = `/bitable/v1/apps/${BITABLE_APP_TOKEN}/tables/${TABLE_ID}/records?page_size=500${pageToken ? "&page_token=" + pageToken : ""}`;
+    const data = await larkRequest(token, "GET", url);
+    if (!data.data?.items) break;
+    data.data.items.forEach(r => {
+      const pid = r.fields["闲鱼商品ID"];
+      if (pid) shelfMap[String(pid)] = r.fields["货架位置"] || "未设置";
+    });
+    if (!data.data.has_more) break;
+    pageToken = data.data.page_token;
+  }
+
+  // 3. 拼提醒消息
+  const dateStr = today.replace(/\//g, "-"); // yyyy-mm-dd 格式
+  const lines = toRemind.map((o, i) => {
+    const pid = String(o.goods?.product_id || "");
+    const title = o.goods?.title || "未知商品";
+    const qty = o.goods?.quantity || 1;
+    const shelf = shelfMap[pid] || "未设置";
+    return `第 ${i + 1} 件\n${title} - ${qty}件 - 货架${shelf}`;
+  });
+
+  const message = `📦 ${dateStr} 待发货提醒: 共计 ${toRemind.length} 个订单\n--\n${lines.join("\n\n")}`;
+  await sendLarkMessage(NOTIFY_CHAT_ID, message);
+
+  toRemind.forEach(o => remindedToday[today].add(o.order_no));
+  console.log(`✅ 已发送待发货提醒: ${toRemind.length} 单`);
+  return message;
+}
+
+// ── 定时任务：每天早上9点（上海时间）同步库存 ──
 cron.schedule("0 9 * * *", () => {
   syncProducts().catch(console.error);
 }, { timezone: "Asia/Shanghai" });
@@ -234,6 +307,13 @@ app.post("/api/webhook", async (req, res) => {
         await sendLarkMessage(chatId, "⏳ 开始同步，请稍候...");
         await syncProducts();
         await sendLarkMessage(chatId, "✅ 库存同步完成！");
+        return;
+      }
+
+      // 手动触发待发货检查
+      if (userText === "查待发货") {
+        await sendLarkMessage(chatId, "⏳ 正在检查待发货订单...");
+        await checkPendingShipments();
         return;
       }
 
