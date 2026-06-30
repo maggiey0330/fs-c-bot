@@ -2,22 +2,18 @@ import express from "express";
 import axios from "axios";
 import crypto from "crypto";
 import cron from "node-cron";
+import dotenv from "dotenv";
+import { WSClient, EventDispatcher } from "@larksuiteoapi/node-sdk";
+
+dotenv.config();
 
 const app = express();
-// 最早期的请求日志：在任何 body 解析之前就打印，方便排查"请求是否真的到达了服务器"
-app.use((req, res, next) => {
-  console.log(`📩 收到请求 ${req.method} ${req.url} @ ${new Date().toISOString()}`);
-  next();
-});
-// 保留原始 body，飞书签名校验需要用到未被解析改写过的原始字节
-app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.json());
 
 const {
   DEEPSEEK_API_KEY,
   FEISHU_APP_ID,
   FEISHU_APP_SECRET,
-  FEISHU_VERIFY_TOKEN, // 飞书开发者后台「事件订阅」里的 Verification Token
-  FEISHU_ENCRYPT_KEY,  // 飞书开发者后台「事件订阅」里的 Encrypt Key（如果开启了加密）
   XGJ_APP_KEY,
   XGJ_APP_SECRET,
   BITABLE_APP_TOKEN,
@@ -89,6 +85,11 @@ async function xgjPost(path, body = {}) {
   });
   if (res.data.code !== 0) throw new Error(`闲管家错误: ${res.data.msg}`);
   return res.data.data;
+}
+
+// ── 查询订单详情（按订单号，用来诊断/校验某个订单的真实状态）──
+async function getOrderDetail(orderNo) {
+  return xgjPost("/order/detail", { order_no: orderNo });
 }
 
 // ── 查货号 ──
@@ -194,46 +195,43 @@ async function syncProducts() {
   await sendLarkMessage(NOTIFY_CHAT_ID, `✅ 库存同步完成！\n更新: ${updated} 件  新增: ${created} 件  删除: ${toDeleteIds.length} 件\n同步时间: ${new Date().toLocaleString("zh-CN")}`);
 }
 
+const ORDER_STATUS_TEXT = {
+  11: "待付款", 12: "待发货", 21: "已发货", 22: "已完成", 23: "已退款", 24: "已关闭",
+};
+
 // ── 待发货提醒 ──
 const OVERDUE_HOURS = 24; // 超过多少小时未发货算超时
 const remindedToday = {}; // 记录：{ "2026/6/30": Set(order_no) }，按天去重，重启会清空
 
-async function checkPendingShipments() {
-  console.log(`[${new Date().toLocaleString("zh-CN")}] 开始检查待发货订单...`);
-  const NOTIFY_CHAT_ID = "oc_564a686f2219aec81155ef7ce5212978";
-  const now = Math.floor(Date.now() / 1000);
-  const overdueSeconds = OVERDUE_HOURS * 3600;
-  const today = new Date().toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
-  if (!remindedToday[today]) remindedToday[today] = new Set();
+// 拉取所有"待发货"且未取消未退款的订单（带分页保护，避免超过100条漏单）
+async function fetchPendingOrders() {
+  let allOrders = [], page = 1;
+  while (true) {
+    const result = await xgjPost("/order/list", {
+      authorize_id: AUTHORIZE_ID,
+      order_status: 12, // 12 = 待发货（已付款、未发货）
+      page_no: page,
+      page_size: 100,
+    });
+    const list = result.list || [];
+    allOrders = allOrders.concat(list);
+    if (allOrders.length >= result.count || list.length < 100) break;
+    page++;
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.log(`📋 接口返回待发货订单(order_status=12): ${allOrders.length} 条，authorize_id=${AUTHORIZE_ID}`);
 
-  // 1. 拉待发货订单
-  const result = await xgjPost("/order/list", {
-    authorize_id: AUTHORIZE_ID,
-    order_status: 12, // 12 = 待发货（已付款、未发货）
-    page_no: 1,
-    page_size: 50,
-  });
-  const allOrders = result.list || [];
-
-  // 状态码为主判断，取消/退款字段做兜底校验
   const pending = allOrders.filter(o =>
     o.order_status === 12 &&
     (!o.cancel_time || o.cancel_time === 0) &&
     (!o.refund_status || o.refund_status === 0)
   );
+  console.log(`📋 排除取消/退款后剩余: ${pending.length} 条`);
+  return pending;
+}
 
-  // 筛选：超时 + 今天还没提醒过
-  const toRemind = pending.filter(o => {
-    const elapsed = now - o.pay_time;
-    return elapsed >= overdueSeconds && !remindedToday[today].has(o.order_no);
-  });
-
-  if (toRemind.length === 0) {
-    console.log("没有需要提醒的待发货订单");
-    return "✅ 没有超时未发货的订单";
-  }
-
-  // 2. 查飞书商品表，拿货架号（按 product_id 关联）
+// 给一批订单拼带货架号的提醒文案
+async function buildOrderListMessage(orders, title) {
   const token = await getLarkToken();
   const shelfMap = {}; // { product_id: 货架位置 }
   let pageToken = "";
@@ -249,22 +247,61 @@ async function checkPendingShipments() {
     pageToken = data.data.page_token;
   }
 
-  // 3. 拼提醒消息
-  const dateStr = today.replace(/\//g, "-"); // yyyy-mm-dd 格式
-  const lines = toRemind.map((o, i) => {
+  const lines = orders.map((o, i) => {
     const pid = String(o.goods?.product_id || "");
-    const title = o.goods?.title || "未知商品";
+    const title2 = o.goods?.title || "未知商品";
     const qty = o.goods?.quantity || 1;
     const shelf = shelfMap[pid] || "未设置";
-    return `第 ${i + 1} 件\n${title} - ${qty}件 - 货架${shelf}`;
+    return `第 ${i + 1} 件\n${title2} - ${qty}件 - 货架${shelf}`;
   });
 
-  const message = `📦 ${dateStr} 待发货提醒: 共计 ${toRemind.length} 个订单\n--\n${lines.join("\n\n")}`;
+  return `${title}: 共计 ${orders.length} 个订单\n--\n${lines.join("\n\n")}`;
+}
+
+// 定时任务调用：只提醒"超过 OVERDUE_HOURS 小时未发货 且 今天还没提醒过"的订单
+async function checkPendingShipments() {
+  console.log(`[${new Date().toLocaleString("zh-CN")}] 开始检查待发货订单...`);
+  const NOTIFY_CHAT_ID = "oc_564a686f2219aec81155ef7ce5212978";
+  const now = Math.floor(Date.now() / 1000);
+  const overdueSeconds = OVERDUE_HOURS * 3600;
+  const today = new Date().toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
+  if (!remindedToday[today]) remindedToday[today] = new Set();
+
+  const pending = await fetchPendingOrders();
+
+  const toRemind = pending.filter(o => {
+    const elapsed = now - o.pay_time;
+    return elapsed >= overdueSeconds && !remindedToday[today].has(o.order_no);
+  });
+  console.log(`📋 其中超过${OVERDUE_HOURS}小时未发货且今天未提醒过的: ${toRemind.length} 条`);
+
+  if (toRemind.length === 0) {
+    const msg = pending.length > 0
+      ? `✅ 当前有 ${pending.length} 个待发货订单，但都还没超过 ${OVERDUE_HOURS} 小时，暂不需要提醒`
+      : "✅ 没有待发货订单";
+    console.log(msg);
+    await sendLarkMessage(NOTIFY_CHAT_ID, msg);
+    return msg;
+  }
+
+  const dateStr = today.replace(/\//g, "-"); // yyyy-mm-dd 格式
+  const message = await buildOrderListMessage(toRemind, `📦 ${dateStr} 超时未发货提醒`);
   await sendLarkMessage(NOTIFY_CHAT_ID, message);
 
   toRemind.forEach(o => remindedToday[today].add(o.order_no));
   console.log(`✅ 已发送待发货提醒: ${toRemind.length} 单`);
   return message;
+}
+
+// 手动指令「查待发货」调用：不看超时，直接列出当前所有待发货订单
+async function listAllPendingShipments(chatId) {
+  const pending = await fetchPendingOrders();
+  if (pending.length === 0) {
+    await sendLarkMessage(chatId, "✅ 当前没有待发货订单");
+    return;
+  }
+  const message = await buildOrderListMessage(pending, "📦 当前待发货订单");
+  await sendLarkMessage(chatId, message);
 }
 
 // ── 定时任务：每天早上9点（上海时间）同步库存 ──
@@ -277,125 +314,113 @@ cron.schedule("0 * * * *", () => {
   checkPendingShipments().catch(console.error);
 }, { timezone: "Asia/Shanghai" });
 
-// ── 飞书事件订阅：解密 + 签名校验 ──
-function decryptFeishuEvent(encryptStr) {
-  const key = crypto.createHash("sha256").update(FEISHU_ENCRYPT_KEY).digest();
-  const buf = Buffer.from(encryptStr, "base64");
-  const iv = buf.subarray(0, 16);
-  const data = buf.subarray(16);
-  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
-  let decrypted = decipher.update(data, undefined, "utf8");
-  decrypted += decipher.final("utf8");
-  return JSON.parse(decrypted);
+// ── 消息去重：飞书在网络抖动/处理较慢时可能重复投递同一条事件 ──
+const processedMessageIds = new Map(); // message_id -> 处理时间戳
+const DEDUP_WINDOW_MS = 10 * 60 * 1000; // 10分钟内的重复消息直接丢弃
+
+function isDuplicateMessage(messageId) {
+  if (!messageId) return false; // 没有 message_id 就不做去重，正常处理
+  const now = Date.now();
+  // 顺手清理过期记录，避免 Map 无限增长
+  for (const [id, ts] of processedMessageIds) {
+    if (now - ts > DEDUP_WINDOW_MS) processedMessageIds.delete(id);
+  }
+  if (processedMessageIds.has(messageId)) return true;
+  processedMessageIds.set(messageId, now);
+  return false;
 }
 
-// 仅在配置了 Encrypt Key 时校验签名（飞书加密回调要求：sha1(timestamp+nonce+encryptKey+rawBody)）
-function verifyFeishuSignature(req) {
-  if (!FEISHU_ENCRYPT_KEY) return true;
-  const timestamp = req.headers["x-lark-request-timestamp"];
-  const nonce = req.headers["x-lark-request-nonce"];
-  const signature = req.headers["x-lark-signature"];
-  if (!timestamp || !nonce || !signature || !req.rawBody) return false;
-  const content = Buffer.concat([
-    Buffer.from(timestamp + nonce + FEISHU_ENCRYPT_KEY),
-    req.rawBody,
-  ]);
-  const hash = crypto.createHash("sha1").update(content).digest("hex");
+// ── 收到一条文本消息时的处理逻辑（被长连接的事件回调调用） ──
+async function handleTextMessage(event) {
   try {
-    return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature));
-  } catch {
-    return false;
+    if (event.message.message_type !== "text") return;
+
+    const messageId = event.message.message_id;
+    if (isDuplicateMessage(messageId)) {
+      console.log("⚠️ 检测到重复消息，已跳过 message_id:", messageId);
+      return;
+    }
+
+    const content = JSON.parse(event.message.content);
+    const userText = content.text.replace(/@\S+/g, "").trim();
+    const chatId = event.message.chat_id;
+    console.log("chat_id:", chatId, "userText:", userText);
+
+    // 手动触发待发货检查（必须放在查货号正则之前，否则"查待发货"会被当成关键词搜索拦截）
+    if (userText === "查待发货") {
+      await sendLarkMessage(chatId, "⏳ 正在查询待发货订单...");
+      await listAllPendingShipments(chatId);
+      return;
+    }
+
+    // 诊断：查某个订单的真实状态，例如「查订单 5122277424755007608」
+    const orderMatch = userText.match(/^查订单\s*(\d+)/);
+    if (orderMatch) {
+      try {
+        const detail = await getOrderDetail(orderMatch[1]);
+        const statusText = ORDER_STATUS_TEXT[detail.order_status] || `未知(${detail.order_status})`;
+        await sendLarkMessage(chatId,
+          `📦 订单 ${detail.order_no}\n状态: ${statusText} (${detail.order_status})\n商品: ${detail.goods?.title || "未知"}\n支付时间: ${detail.pay_time ? new Date(detail.pay_time * 1000).toLocaleString("zh-CN") : "无"}\n取消时间: ${detail.cancel_time || "无"}\n退款状态: ${detail.refund_status}`
+        );
+      } catch (err) {
+        await sendLarkMessage(chatId, `❌ 查询失败: ${err.message}`);
+      }
+      return;
+    }
+
+    // 手动触发同步
+    if (userText === "同步库存") {
+      await sendLarkMessage(chatId, "⏳ 开始同步，请稍候...");
+      await syncProducts();
+      await sendLarkMessage(chatId, "✅ 库存同步完成！");
+      return;
+    }
+
+    // 查货号：「查 BKM」「货号 SANR」
+    const queryMatch = userText.match(/^(查|货号|查询)\s*(.+)/);
+    if (queryMatch) {
+      const keyword = queryMatch[2].trim();
+      const records = await queryProductByKeyword(keyword);
+      if (records.length === 0) {
+        await sendLarkMessage(chatId, `❌ 没找到「${keyword}」相关商品`);
+      } else {
+        const lines = records.map(r => {
+          const f = r.fields;
+          return `📦 ${f["商品标题"]}\n库存: ${f["库存"]}  售价: ¥${f["售价"]}\n货架: ${f["货架位置"] || "未设置"}`;
+        });
+        await sendLarkMessage(chatId, lines.join("\n\n"));
+      }
+      return;
+    }
+
+    // 普通对话
+    const reply = await askDeepSeek(userText);
+    await sendLarkMessage(chatId, reply);
+
+  } catch (err) {
+    console.error("处理消息出错:", err);
   }
 }
 
-// ── Webhook ──
+// ── 健康检查（给 Railway 探活用，飞书消息不再走这条路） ──
 app.get("/", (req, res) => res.send("ok"));
 
-app.post("/api/webhook", async (req, res) => {
-  console.log("➡️ 进入 /api/webhook 处理函数");
-  // 1. 签名校验（开启了 Encrypt Key 的情况下）
-  if (!verifyFeishuSignature(req)) {
-    console.warn("⚠️ 飞书签名校验失败，已拒绝请求");
-    return res.status(401).end();
-  }
-  console.log("✅ 签名校验通过（或未开启加密）");
+// ── 飞书长连接：服务器主动连出去拿事件，不再需要公网可被飞书访问的请求地址 ──
+const eventDispatcher = new EventDispatcher({}).register({
+  "im.message.receive_v1": async (data) => {
+    await handleTextMessage(data);
+  },
+});
 
-  // 2. 解密（如果开启了加密），否则直接用明文 body
-  let body = req.body;
-  if (body.encrypt) {
-    try {
-      body = decryptFeishuEvent(body.encrypt);
-    } catch (err) {
-      console.error("解密飞书事件失败:", err.message);
-      return res.status(400).end();
-    }
-  }
-  console.log("📦 body 解析完成, type:", body.type, "event_type:", body.header?.event_type);
+const wsClient = new WSClient({
+  appId: FEISHU_APP_ID,
+  appSecret: FEISHU_APP_SECRET,
+});
 
-  // 3. url_verification 阶段
-  if (body.type === "url_verification" || body.challenge) {
-    return res.status(200).json({ challenge: body.challenge });
-  }
-
-  // 4. Token 校验（未加密的旧版事件订阅模式，必须配置 FEISHU_VERIFY_TOKEN）
-  if (FEISHU_VERIFY_TOKEN && body.token !== FEISHU_VERIFY_TOKEN) {
-    console.warn("⚠️ 飞书 Verification Token 不匹配，已拒绝请求 body.token=", body.token);
-    return res.status(401).end();
-  }
-  console.log("✅ Token 校验通过（或未配置）, 即将返回 200");
-
-  res.status(200).end();
-
-  if (body.header?.event_type === "im.message.receive_v1") {
-    try {
-      const event = body.event;
-      if (event.message.message_type !== "text") return;
-
-      const content = JSON.parse(event.message.content);
-      const userText = content.text.replace(/@\S+/g, "").trim();
-      const chatId = event.message.chat_id;
-      console.log("chat_id:", chatId);
-
-      // 手动触发待发货检查（必须放在查货号正则之前，否则"查待发货"会被当成关键词搜索拦截）
-      if (userText === "查待发货") {
-        await sendLarkMessage(chatId, "⏳ 正在检查待发货订单...");
-        await checkPendingShipments();
-        return;
-      }
-
-      // 手动触发同步
-      if (userText === "同步库存") {
-        await sendLarkMessage(chatId, "⏳ 开始同步，请稍候...");
-        await syncProducts();
-        await sendLarkMessage(chatId, "✅ 库存同步完成！");
-        return;
-      }
-
-      // 查货号：「查 BKM」「货号 SANR」
-      const queryMatch = userText.match(/^(查|货号|查询)\s*(.+)/);
-      if (queryMatch) {
-        const keyword = queryMatch[2].trim();
-        const records = await queryProductByKeyword(keyword);
-        if (records.length === 0) {
-          await sendLarkMessage(chatId, `❌ 没找到「${keyword}」相关商品`);
-        } else {
-          const lines = records.map(r => {
-            const f = r.fields;
-            return `📦 ${f["商品标题"]}\n库存: ${f["库存"]}  售价: ¥${f["售价"]}\n货架: ${f["货架位置"] || "未设置"}`;
-          });
-          await sendLarkMessage(chatId, lines.join("\n\n"));
-        }
-        return;
-      }
-
-      // 普通对话
-      const reply = await askDeepSeek(userText);
-      await sendLarkMessage(chatId, reply);
-
-    } catch (err) {
-      console.error("Error:", err);
-    }
-  }
+wsClient.start({ eventDispatcher }).then(() => {
+  console.log("🔌 飞书长连接已建立");
+}).catch((err) => {
+  console.error("🔴 飞书长连接启动失败:", err);
 });
 
 process.on("unhandledRejection", (reason) => {
@@ -407,3 +432,4 @@ process.on("uncaughtException", (err) => {
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+[admin@iZuf6g21iu5p7voctgwj3eZ fs-c-bot]$ 
