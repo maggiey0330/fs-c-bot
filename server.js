@@ -285,6 +285,21 @@ app.post("/api/webhook", async (req, res) => {
       const chatId = event.message.chat_id;
       console.log("chat_id:", chatId);
 
+      // 手动触发待发货检查（必须放在查货号正则之前，否则"查待发货"会被当成关键词搜索拦截）
+      if (userText === "查待发货") {
+        await sendLarkMessage(chatId, "⏳ 正在检查待发货订单...");
+        await checkPendingShipments();
+        return;
+      }
+
+      // 手动触发同步
+      if (userText === "同步库存") {
+        await sendLarkMessage(chatId, "⏳ 开始同步，请稍候...");
+        await syncProducts();
+        await sendLarkMessage(chatId, "✅ 库存同步完成！");
+        return;
+      }
+
       // 查货号：「查 BKM」「货号 SANR」
       const queryMatch = userText.match(/^(查|货号|查询)\s*(.+)/);
       if (queryMatch) {
@@ -299,21 +314,6 @@ app.post("/api/webhook", async (req, res) => {
           });
           await sendLarkMessage(chatId, lines.join("\n\n"));
         }
-        return;
-      }
-
-      // 手动触发同步
-      if (userText === "同步库存") {
-        await sendLarkMessage(chatId, "⏳ 开始同步，请稍候...");
-        await syncProducts();
-        await sendLarkMessage(chatId, "✅ 库存同步完成！");
-        return;
-      }
-
-      // 手动触发待发货检查
-      if (userText === "查待发货") {
-        await sendLarkMessage(chatId, "⏳ 正在检查待发货订单...");
-        await checkPendingShipments();
         return;
       }
 
